@@ -1,0 +1,28 @@
+---
+title: "ds4ppfinal"
+author: "F Otis"
+date: "4/19/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE,echo = FALSE}
+library(tidyverse)
+library(janitor)
+library(haven)
+
+```
+```{r}
+#https://healthpolicy.ucla.edu/chis/data/public-use-data-file/Pages/2019.aspx
+health_data <- read_dta("ADULT.dta")
+
+#https://data.ca.gov/dataset/calenviroscreen-3-0-results
+environment_data <- read_csv("calenviroscreen-3.0-results-june-2018-update.csv")
+
+```
+
+
+
