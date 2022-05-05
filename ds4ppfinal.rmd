@@ -13,16 +13,283 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(janitor)
 library(haven)
+library(sjlabelled)
+library(readxl)
 
+library(glmnet)
+
+library(modelr)
+library(broom)
+
+library(rsample)
+library(tidymodels)
+
+library(sf)
+library(leaflet)
+
+set.seed(0451)
 ```
-```{r}
+
+```{r data load}
 #https://healthpolicy.ucla.edu/chis/data/public-use-data-file/Pages/2019.aspx
-health_data <- read_dta("ADULT.dta")
+health_data <- clean_names(read_dta("ADULT.dta"))
 
 #https://data.ca.gov/dataset/calenviroscreen-3-0-results
 environment_data <- read_csv("calenviroscreen-3.0-results-june-2018-update.csv")
+environment_data <- clean_names(environment_data)
+
+#https://data.ca.gov/dataset/asthma-prevalence/resource/d1101de5-0137-4bd2-8020-b5346fe9f546
+current_asthma_prevalence <- read_xlsx("chis-data-current-asthma-prevalence-by-county.xlsx")
+lifetime_asthma_prevalence <- read_xlsx("chis-data-lifetime-asthma-prevalence-by-county.xlsx")
+
+#census american household survey
+race_tracts <- clean_names(read_csv("ACSDT5Y2020.B02001-2022-05-05T015935.csv"))
+
+county_codes <- clean_names(read_csv("county_numbers.csv"))
+```
+
+```{r functions}
+# Function to standardize a given variable (assuming no missing data).
+standardize <- function(x){
+  (x - mean(x))/sd(x)
+}
+
+# Function to calculate RMSE given our design matrix rather
+# than original data.
+rmse_by_hand <- function(this_model, x_holdout, y_holdout ){
+  this_pred <- predict(this_model, newx = x_holdout)
+  
+  mean( (this_pred - y_holdout)^2 )
+}
+```
+
+```{r machine learning prep}
+env_data_ml <- environment_data %>% 
+  dplyr::select(c(total_population, 
+            ozone,
+            pm2_5,
+            diesel_pm,
+            tox_release,
+            traffic,
+            cleanup_sites,
+            groundwater_threats,
+            haz_waste,
+            solid_waste,
+            pollution_burden,
+            asthma,
+            education,
+            linguistic_isolation,
+            poverty,
+            unemployment,
+            housing_burden))
+
+env_data_ml <- env_data_ml %>% na.omit()
+
+env_data_ml <- env_data_ml %>% 
+  mutate(total_population = standardize(total_population), 
+        ozone = standardize(ozone),
+        pm2_5 = standardize(pm2_5), 
+        diesel_pm = standardize(diesel_pm),
+        tox_release = standardize(tox_release),
+        traffic = standardize(traffic),
+        cleanup_sites = standardize(cleanup_sites),
+        groundwater_threats = standardize(groundwater_threats),
+        haz_waste = standardize(haz_waste),
+        solid_waste = standardize(solid_waste),
+        pollution_burden = standardize(pollution_burden),
+        asthma = standardize(asthma),
+        education = standardize(education),
+        linguistic_isolation = standardize(linguistic_isolation),
+        poverty = standardize(poverty),
+        unemployment = standardize(unemployment),
+        housing_burden = standardize(housing_burden))
+
+env_split <- initial_split(env_data_ml, prop = 0.05)
+
+env_training <- training(env_split)
+env_holdout <- testing(env_split)
+
+x <- model.matrix(asthma ~ ., env_training)[,-1]
+y <- as.numeric(env_training$asthma)
+
+x_holdout <- model.matrix(asthma ~ ., env_holdout)[,-1]
+y_holdout <- as.numeric(env_holdout$asthma)
 
 ```
+
+```{r linear model}
+model_linear <- lm(asthma ~ ., data = env_training)
+
+model_linear %>% glance()
+
+modelr::rmse(model_linear, data = env_holdout)
+```
+
+```{r forward stepwise selection}
+mod_simple <- lm(asthma ~ 1, data = env_training)
+mod_max <- lm(asthma ~ ., data = env_training)
+
+mod_forward <- stepAIC(mod_simple, scope = list(lower = formula(mod_simple), 
+                                                upper = formula(mod_max)),
+                       direction = "forward",
+                       trace = 0)
+
+summary(mod_forward)
+
+modelr::rmse(mod_forward, env_holdout)
+```
+
+```{r}
+library(tree)
+model_tree <- tree(asthma ~ ., data = env_training)
+
+summary(model_tree)
+modelr::rmse(model_tree, env_holdout)
+```
+
+
+```{r random forest}
+library(randomForest)
+
+model_rf <- randomForest(x = x, y = y, importance = TRUE, ntree = 100)
+
+model_rf
+
+importance(model_rf)
+varImpPlot(model_rf, main = "Variable Importance Plot", ype = 1, pch = 16, cex = 1.5, pt.cex = 1.5)
+
+rmse_rf <- function(rf_model){
+  this_pred <- predict(rf_model, x_holdout)
+  
+  mean( (this_pred - y_holdout)^2 )
+}
+
+rmse_rf(model_rf)
+
+```
+
+```{r compare models}
+results = data.frame(RMSE = c( OLS = modelr::rmse(model_linear, env_holdout),
+                               forward = modelr::rmse(mod_forward, env_holdout),
+                               CART = modelr::rmse(model_tree, env_holdout),
+                               RF = rmse_rf(model_rf)))
+
+print(results)
+```
+
+```{r load in shape file}
+areas <- st_read("tl_2021_06_tract/tl_2021_06_tract.shp") %>% 
+  clean_names() %>% 
+  mutate(geoid = as.numeric(geoid)) 
+
+areas %>% 
+  leaflet() %>%
+  addTiles() %>% 
+  addPolygons(color = "grey", 
+              weight = 1)
+
+areas_env <- left_join(areas, environment_data, 
+                       by = c("geoid" = "census_tract"))
+```
+
+
+```{r asthma heat map}
+bin_asthma <- c(0,30,60,90,120,250)
+pal_asthma <- colorBin("Blues", domain = areas_env$asthma, bin = bin_asthma)
+areas_env %>% 
+  leaflet() %>% 
+  addTiles() %>% 
+  addPolygons(color = pal_asthma(areas_env$asthma),
+              label = areas_env$asthma,
+              weight = 1,
+              smoothFactor = 0.5,
+              opacity = 1.0,
+              fillOpacity = ifelse(is.na(areas_env$asthma),0.2,0.75),
+              fillColor = pal_asthma(areas_env$asthma)) %>% 
+      addLegend(pal = pal_asthma,
+              values = ~areas_env$asthma,
+              opacity = 0.7,
+              title = "Asthma Incidence (Rate of emergency department ED visits for asthma per 10,000)",
+              position = "topright")
+```
+
+```{r}
+race_tracts <- clean_names(read_csv("ACSDT5Y2020.B02001-2022-05-05T015935.csv"))
+
+race_tracts <- left_join(race_tracts,county_codes)
+race_tracts <- race_tracts %>% mutate(
+  census_tract = ifelse(grepl(".", census_tract, fixed = T), 
+                         census_tract,
+                         paste(census_tract, ".00", sep = "")))
+
+race_tracts <- race_tracts %>% 
+  mutate(census_tract = gsub(".", "", as.character(census_tract), fixed=T))
+
+race_tracts <- race_tracts %>% mutate(
+  census_tract = paste("6",
+                       sprintf("%03d", county_number),
+                       gsub(" ", "0", sprintf("%06s",census_tract), fixed = T),
+                       sep=""))
+
+race_tracts <- race_tracts %>% dplyr::select(-c(county_number))
+environment_data <- environment_data %>% mutate(census_tract = as.character(census_tract))
+environment_data <- left_join(environment_data,race_tracts)
+
+environment_data <- environment_data %>% mutate(nonwhite_percent = (total - total_white_alone) / total)
+environment_data <- environment_data %>% mutate(black_percent = total_black_or_african_american_alone / total)
+```
+
+```{r}
+environment_data %>% 
+  ggplot(aes(x = nonwhite_percent, y = asthma)) +
+  geom_point(aes(col = sb_535_disadvantaged_community)) + 
+  geom_smooth(method = "lm", formula = y~x, se = T) +
+  facet_wrap(vars(sb_535_disadvantaged_community))
+
+environment_data %>% 
+  ggplot(aes(x = black_percent, y = asthma)) +
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y~x, se = T)
+```
+
+
+
+
+
+
+```{r}
+env_data_ml %>% 
+  ggplot(aes(x = poverty, y = asthma)) +
+  geom_point(position = "jitter") +
+  geom_smooth(method='lm', formula= y~x, se = TRUE, col = "#888888")
+```
+
+
+
+```{r logit regression}
+health_data_small <- health_data %>%
+  dplyr::select(c("ab17","ombsrr_p1","smoking","ak22_p1", "ur_ihs","povll")) %>%
+  mutate(has_asthma = abs(2-ab17), 
+         white = ifelse(ombsrr_p1 == 2, 1, 0),
+         smoked = ifelse(smoking == 3, 0, 1),
+         income = ak22_p1,
+         rural = ur_ihs-1,
+         poverty = ifelse(povll==1,1,0))
+
+individual_health_lm <- lm(has_asthma ~ rural + white, data = health_data_small)
+summary(individual_health_lm)
+
+logit <- glm(has_asthma ~ white + smoked + rural + poverty, 
+              family = "binomial",
+              data = health_data_small)
+summary(logit)
+```
+
+
+
+
+
+
 
 
 
